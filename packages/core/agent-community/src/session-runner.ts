@@ -419,6 +419,30 @@ class KeyedMutex {
   }
 }
 
+/**
+ * Does a `turn/end` error message describe a REJECTED REQUEST?
+ *
+ * Two families qualify, and both must be reported as a failure rather than mistaken for
+ * "the model chose not to speak":
+ *
+ *   1. transport/provider failures — HTTP status, auth, timeouts, dropped connections;
+ *   2. CONFIGURATION rejections the LLM layer raises *before* network I/O. The one observed in
+ *      the field is `UNSUPPORTED_REASONING_EFFORT`: a provider/model that publishes no reasoning
+ *      levels (any custom `api: openai-completions` model row today) rejects *every*
+ *      `reasoningEffort`, with
+ *        provider "workbuddy" model "cn:deepseek-v4.1-flash" does not support reasoning effort "max"
+ *      That message names no HTTP code, so a status-only pattern missed it, `readTurn` saw no
+ *      assistant text, and the run settled `completed` / `finishPath: 'empty'`: every bot turn
+ *      died in ~20 ms and the user saw a grey「模型输出为空」notice with no error anywhere.
+ *
+ * A reasoning-only turn — the case the repair prompt exists for — does NOT match: its message
+ * describes the model's output, not the request.
+ */
+export function looksLikeProviderRejection(message: string): boolean {
+  return /request failed|HTTP[_ ]?\d|\b(401|403|404|429|5\d\d)\b|unauthor|forbidden|timed? ?out|ECONN|fetch failed|does not support|unsupported/iu
+    .test(message)
+}
+
 export class SessionRunner {
   private readonly ctx: Context
   private readonly accessor: SessionRunnerAccessor
@@ -1043,22 +1067,24 @@ export class SessionRunner {
       const reason = event.data?.reason
       if (reason?.kind !== 'error') return undefined
       const message = reason.error?.message ?? ''
-      // A provider/transport failure, not an internal "the model chose not to speak".
-      const looksLikeRequestFailure = /request failed|HTTP[_ ]?\d|\b(401|403|404|429|5\d\d)\b|unauthor|forbidden|timed? ?out|ECONN|fetch failed/iu
-        .test(message)
+      // A provider/transport/config rejection, not an internal "the model chose not to speak".
+      const looksLikeRequestFailure = looksLikeProviderRejection(message)
       return looksLikeRequestFailure ? message : undefined
     }
     return undefined
   }
 
   /**
-   * Arm a ONE-SHOT `reasoningEffort: 'off'` override for this agent's next request.
+   * Arm a ONE-SHOT "no reasoning level" override for this agent's next request.
    *
    * `agent/request` is a waterfall whose default returns the config proposal, so a
    * listener can rewrite it. Doing it here — rather than changing the bot's own
    * reasoning setting — keeps the user's configuration untouched and affects exactly
    * one request, which is the whole point of the recovery: with the reasoning
-   * channel unavailable the model must write into the text channel.
+   * channel unavailable the model must write into the text channel. The override
+   * REMOVES the field (provider default) rather than forcing `'off'`, because a model
+   * that publishes no levels rejects every value — including `'off'` — before the
+   * request is sent, which would turn our own repair into a fake model failure.
    */
   private armTextOnlyRequest(roomId: string, botId: string): void {
     const key = SessionRunner.key(roomId, botId)
@@ -1096,7 +1122,17 @@ export class SessionRunner {
       this.reapplyToolMask(agentCtx, key)
       const config = await next() as Record<string, unknown>
       if (!this.textOnlyArmed.delete(key)) return config
-      return { ...config, reasoningEffort: 'off' }
+      // ── ASK FOR THE PROVIDER DEFAULT, NOT FOR `'off'` ─────────────────────────
+      //
+      // This one-shot override exists so the repaired request writes into the TEXT channel. It
+      // used to force `reasoningEffort: 'off'`, which is the same trap `ensureAgent` fell into:
+      // a model that publishes no reasoning levels rejects the field *whatever* its value, so
+      // the repair round died with `UNSUPPORTED_REASONING_EFFORT` and the run reported
+      // "reasoning-only after N repair attempt(s)" — a model fault invented by our own override.
+      // Dropping the field asks for the provider default, which at least lets the request run.
+      const repaired = { ...config }
+      delete repaired.reasoningEffort
+      return repaired
     }, { prepend: true })
   }
 

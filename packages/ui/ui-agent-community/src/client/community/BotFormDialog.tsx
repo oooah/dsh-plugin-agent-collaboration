@@ -62,8 +62,10 @@ export function BotFormDialog({
   const [botName, setBotName] = useState(editingBot?.name ?? '')
   const [botDesc, setBotDesc] = useState(editingBot?.description ?? '')
   const [botPrompt, setBotPrompt] = useState(editingBot?.systemPrompt ?? '')
-  // Provider-valid set only: anything else is rejected with UNSUPPORTED_REASONING_EFFORT.
-  const [botEffort, setBotEffort] = useState(editingBot?.reasoningEffort ?? 'max')
+  // `''` = "ask the provider for its own default" — the only choice that is valid on every
+  // route. A model that publishes no reasoning levels rejects EVERY explicit level with
+  // UNSUPPORTED_REASONING_EFFORT, so a non-empty default here creates bots that cannot answer.
+  const [botEffort, setBotEffort] = useState(editingBot?.reasoningEffort ?? '')
   const [botAvatar, setBotAvatar] = useState(editingBot?.avatar.seed ?? '🤖')
   const [botMentionOnly, setBotMentionOnly] = useState(editingBot?.mentionOnly ?? false)
   const [botPermission, setBotPermission] = useState<'read-only' | 'workspace-write' | 'full-access'>(editingBot?.permission ?? 'full-access')
@@ -183,11 +185,18 @@ export function BotFormDialog({
     }
   }
 
-  /** Move to the model's own default level when the current one is not offered. */
+  /**
+   * Move to the model's own default level when the current one is not offered.
+   *
+   * A model that publishes nothing falls back to `''` (provider default): keeping the previous
+   * value there would preserve a level the route is guaranteed to reject, so opening the form
+   * and saving would still leave a bot that cannot answer.
+   */
   function alignEffort(provider: string, model: string, previous: string): string {
     const { options, fallback } = effortsFor(provider, model)
     if (options.some(option => option.id === previous)) return previous
-    return fallback !== '' ? fallback : previous
+    if (fallback !== '') return fallback
+    return options.length === 0 ? '' : previous
   }
 
   function handleSelectProvider(next: string) {
@@ -381,14 +390,14 @@ export function BotFormDialog({
                         <span className={css.rowControl}><select className={css.select} value={botEffort} onChange={e => setBotEffort(e.target.value)}>
                           {(() => {
                             const published = effortsFor(botProvider, botModel).options
-                            // A model that publishes levels shows exactly those. One that
-                            // publishes none keeps the deployment's classic set, so this
-                            // never removes a choice the host still accepts.
-                            const options = published.length > 0
-                              ? published
-                              : [{ id: 'off', name: 'off' }, { id: 'low', name: 'low' }, { id: 'high', name: 'high' }, { id: 'max', name: 'max' }]
+                            // Offer exactly what the route accepts. A model that publishes no
+                            // levels accepts NONE of the classic off/low/high/max set — the host
+                            // throws UNSUPPORTED_REASONING_EFFORT for any explicit value — so
+                            // listing them here only lets the user create a bot that can never
+                            // answer. '默认' (the empty id) is then the single valid choice.
+                            const options = published
                             const items = [...options]
-                            if (items.length > 0 && !items.some(o => o.id === '')) items.unshift({ id: '', name: '默认' })
+                            if (!items.some(o => o.id === '')) items.unshift({ id: '', name: '默认' })
                             if (botEffort !== '' && !items.some(o => o.id === botEffort)) {
                               items.unshift({ id: botEffort, name: `${botEffort}（当前值，设置中未列出）` })
                             }

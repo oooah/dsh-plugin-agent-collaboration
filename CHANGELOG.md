@@ -1,3 +1,22 @@
+## Unreleased — 推理档位不被支持时的静默空回复
+
+- **修复：bot 默认推理档位由 `max` 改为 `''`（provider 默认）。** 模型没有公布推理档位时（所有
+  手写 `api: openai-completions` 的模型行 —— 例如本机 `workbuddy` 路由下的
+  `cn:deepseek-v4.1-flash`），DSH 在联网前就以 `UNSUPPORTED_REASONING_EFFORT` 拒绝**任何**显式
+  档位（`resolveCallWithInfo`：`reasoning === undefined && requested !== undefined` 直接抛错）。
+  于是一个用默认配置新建的 bot，每个回合都在 ~20 ms 内「完成」、没有任何正文。
+- **修复：`providerFailure()` 把配置级拒绝也算作请求失败**（`does not support` / `unsupported`）。
+  这类消息不携带 HTTP 状态码，过去被读成「模型没说话」：run 以 `completed` +
+  `finishPath: 'empty'` 收口，面板只显示一行灰色「模型输出为空」诊断，用户看不到任何错误。
+  现在以 `failed` 收口并显示 provider 原文。
+- **修复：纯思考修复请求不再强制 `reasoningEffort: 'off'`**（对同一路由同样是非法值，会把我们
+  自己的修复动作伪装成模型故障），改为删除该字段、走 provider 默认。
+- **UI：思考强度下拉只列出该模型实际公布的档位。** 一个档位都没公布时只提供「默认」，不再让
+  用户建出一个必然无法回复的 bot；切换模型或打开旧 bot 时档位也会自动回落到「默认」。
+- 新增 `tests/provider-rejection.test.ts`。全量测试 **542/545**；7 个失败是
+  `file-handoff.test.ts` 在 Windows 上**改动前即存在**的失败（已在上游 main 同一环境下复现，
+  与本改动无关）。
+
 ## 0.3.5 — 长任务活跃豁免
 
 - 运行中的工具调用（`tool-start`…`tool-end`）现在被识别为**真实进展**：工具在跑时不再触发

@@ -334,12 +334,15 @@ export const Config: z<Config> = z.object({
   groupProposalTimeoutMs: z.number().step(1).min(1000).default(120_000),
   sessionsDir: z.string().required(false),
   /**
-   * Reasoning effort for bot turns. The provider accepts exactly
-   * `off | low | high | max` (anything else is rejected with
-   * UNSUPPORTED_REASONING_EFFORT); `''` lets the caller fall back to the default.
-   * Per-bot overrides live on the bot itself (see the bot settings form).
+   * Default reasoning effort for bot turns. `''` means "whatever the provider/model defaults
+   * to", and it is the only value that is safe on every route: a model that publishes no
+   * reasoning levels — every hand-declared `api: openai-completions` model row — REJECTS any
+   * explicit level with UNSUPPORTED_REASONING_EFFORT before the request leaves the process
+   * (`resolveCallWithInfo`: `reasoning === undefined && requested !== undefined` throws), so a
+   * non-empty default here makes every bot turn fail on such a deployment. A provider that does
+   * publish levels still honours what each bot sets for itself (see the bot settings form).
    */
-  botReasoningEffort: z.string().default('max'),
+  botReasoningEffort: z.string().default(''),
   /**
    * Agent preset every bot session runs under. `standard` is the deployment's normal
    * session profile, so bots see the same tool families the user does.
@@ -765,7 +768,7 @@ export class AgentCommunityService extends TypertRemoteService {
       memoryEntriesPerRoom: config.memoryEntriesPerRoom ?? 12,
       memoryPromptEntries: config.memoryPromptEntries ?? 8,
       groupProposalTimeoutMs: config.groupProposalTimeoutMs ?? 120_000,
-      botReasoningEffort: config.botReasoningEffort ?? 'max',
+      botReasoningEffort: config.botReasoningEffort ?? '',
     }
     this.home = resolveAgentCommunityHome({
       configured: config.homeDir,
@@ -1058,7 +1061,7 @@ export class AgentCommunityService extends TypertRemoteService {
         runLeaseMs: config.runLeaseMs ?? 60_000,
         historyMessages: config.historyMessagesInPrompt ?? 10,
         memoryPromptEntries: config.memoryPromptEntries ?? 8,
-        defaultReasoningEffort: config.botReasoningEffort ?? 'max',
+        defaultReasoningEffort: config.botReasoningEffort ?? '',
         // The executor reserves a live row and writes the final answer for every run;
         // this view drops both for an internal run so its turn never reaches the panel.
         // The one row it may owe the user (a finish report) is pushed by `settleRun`.
