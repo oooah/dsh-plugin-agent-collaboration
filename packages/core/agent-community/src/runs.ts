@@ -585,7 +585,7 @@ export class RunExecutor {
     const runAbort = this.runAborts.get(run.id)
     let outcome: Awaited<ReturnType<typeof runner.run>>
     try {
-      outcome = await runner.run(run.roomId, bot.id, prompt, delta, true, runAbort?.signal, onProgress)
+      outcome = await runner.run(run.roomId, bot.id, prompt, delta, true, runAbort?.signal, onProgress, run.id)
     } catch (error: unknown) {
       // A failed turn must not leave a row on `streaming: true`, or the panel shows
       // "处理中…" over an answer that will never come and the turn looks live forever.
@@ -893,7 +893,10 @@ export class RunExecutor {
     }
     const target = this.runTargets.get(runId)
     if (target !== undefined) {
-      this.sessionRunner?.cancel(target.roomId, target.botId, reason)
+      // The run id goes with the request: only the run that owns the pair's live turn may
+      // cancel it (see `SessionRunner.cancel`). A queued run of the same pair has a target but
+      // no turn of its own — its stop must not abort the other run's model request.
+      this.sessionRunner?.cancel(target.roomId, target.botId, reason, runId)
       return
     }
     // No registered target: only a run this process is actually driving has an agent to
@@ -902,7 +905,7 @@ export class RunExecutor {
     if (controller === undefined) return
     const run = this.svc.listRuns().find(r => r.id === runId)
     if (run !== undefined && (run.status === 'running' || run.status === 'queued')) {
-      this.sessionRunner?.cancel(run.roomId, run.botId, reason)
+      this.sessionRunner?.cancel(run.roomId, run.botId, reason, runId)
     }
   }
 
@@ -1394,6 +1397,46 @@ export class RunExecutor {
   }
 
   /**
+   * A run's turn actually began — restart its execution budget clock.
+   *
+   * Called by {@link SessionRunner} once the pair's mutex is held and the agent is ready. The
+   * budget used to start at the CLAIM, which charged the time a run spent queued behind the
+   * previous turn of the same bot against the model's allowance: a follow-up message then failed
+   * with "已用 180s，预算 180s" having produced nothing. Everything before this point is queue
+   * time, not execution, so the deadline is recomputed from now and the run's own derived budget
+   * (not the cap) still applies.
+   */
+  onTurnStarted(runId: string): void {
+    const budget = this.runBudgets.get(runId)
+    if (budget === undefined) return
+    const now = Date.now()
+    const waitedMs = now - budget.startedAtMs
+    if (waitedMs < 1_000) return
+    budget.startedAtMs = now
+    budget.deadlineAtMs = now + budget.baseBudgetMs
+    budget.lastProgressAtMs = now
+    budget.lastProgressSeenMs = now
+    budget.progressEvents = 0
+    budget.lastPersistMs = now
+    this.svc.updateRunBudget(runId, {
+      deadlineAt: new Date(budget.deadlineAtMs).toISOString(),
+      lastProgressAt: new Date(now).toISOString(),
+    })
+    const waitedS = Math.round(waitedMs / 1000)
+    const budgetS = Math.round(budget.baseBudgetMs / 1000)
+    this.ctx.logger?.info?.(
+      `agent-community: run ${runId} waited ${waitedS}s for its pair's turn — `
+      + `execution budget restarted (${budgetS}s)`,
+    )
+    this.ledger?.push({
+      type: 'dispatch',
+      roomId: budget.roomId,
+      text: `排队等待 ${waitedS}s 后才轮到本回合，执行预算从此刻起重新计时 ${budgetS}s`,
+      at: new Date(now).toISOString(),
+    })
+  }
+
+  /**
    * A real sign of work from the runner: update the in-memory progress clock (authoritative
    * for the deadline check) and persist it at most every few seconds.
    */
@@ -1449,6 +1492,29 @@ export class RunExecutor {
       // A run settled/aborted elsewhere drops out of supervision silently.
       if (run === undefined || run.status !== 'running') {
         this.runBudgets.delete(runId)
+        continue
+      }
+      // ── A RUN WAITING FOR ITS PAIR'S TURN HAS NOT SPENT ITS BUDGET YET ─────────────
+      //
+      // Two runs of one (room, bot) coexist whenever a second message arrives during the first's
+      // turn: the runner serialises them with a per-pair mutex, so this one sits in the queue
+      // doing nothing while its deadline ticks. Enforcing that deadline killed a follow-up
+      // message at "已用 180s，预算 180s" without it ever sending a request — and the stop it
+      // then issued cancelled the turn the OTHER run was driving (that reached a pending
+      // approval dialog, which came back as `cancelled` mid-turn).
+      //
+      // The wait itself stays bounded by the overall cap, so a pair can never queue forever.
+      if (this.sessionRunner !== undefined
+        && !this.sessionRunner.isTurnOwner(run.roomId, run.botId, runId)) {
+        const waitedMs = now - budget.startedAtMs
+        if (waitedMs > this.timeoutPolicy.capMs) {
+          await this.failRunForBudget(
+            run,
+            budget,
+            'timeout',
+            `等待同一 bot 的上一轮结束超过总上限 ${Math.round(this.timeoutPolicy.capMs / 1000)}s`,
+          )
+        }
         continue
       }
       // ── ACTIVE TOOL EXEMPTION ──────────────────────────────────────────────
@@ -1608,7 +1674,14 @@ export class RunExecutor {
       )
     }
     try { this.runAborts.get(run.id)?.abort(new Error(kind)) } catch { /* best-effort */ }
-    this.sessionRunner?.cancel(budget.roomId, budget.botId, kind === 'no-progress' ? 'no progress' : 'timeout')
+    this.sessionRunner?.cancel(
+      budget.roomId,
+      budget.botId,
+      kind === 'no-progress' ? 'no progress' : 'timeout',
+      // Scoped to THIS run: a budget verdict is a statement about one run, and the pair's live
+      // turn may belong to another run entirely (the queued follow-up case).
+      run.id,
+    )
     if (!settled) return
     this.ledger?.push({
       type: 'error',

@@ -1,3 +1,20 @@
+## Unreleased — 停止只作用于一个 run；bot 的审批必须真的能到达
+
+- **修复：停止/超时不再误杀同房间同 bot 的另一个回合。** 执行器按 `(roomId, botId)` 取消 live
+  agent，而同一对的第二个 run 只是在等这把互斥锁 —— 它自己的预算超时后取消的是**第一个 run 正在
+  跑的请求**。实测：run A 卡在审批对话框上 19 分 49 秒，run B 排在后面，B 的 180s 预算耗尽时把 A
+  的请求取消了，A 的审批变成 `cancelled`，两条 run 同一秒收口。现在 `cancel` 带上 runId，只对
+  「当前真正持有本回合」的 run 生效（`stopReachesTurn`，已加测试）。
+- **修复：排队等待不再计入执行预算。** `deadlineAt` 原本在认领时就写死，于是排队时间被当成执行
+  时间：B 在一条请求都没发出的情况下以「已用 180s，预算 180s」失败。现在预算在回合**真正开始**
+  时才起算（`SessionRunner.onTurnStart` → `RunExecutor.onTurnStarted`），排队本身另受总上限约束。
+- **修复：bot 的审批对话框不再可能永远挂着。** bot 会话是隐藏的 `subagent` 会话，DSH 原生审批卡
+  没有可渲染的界面；一旦 `memberRoomId()` 没命中（会话表缺失/被重写、旧 generation id），对话框
+  会穿透到原生 UI 而无人可见。现在审批桥回落到解析自己生成的会话 id（`ac:<roomId>:<botId>`），
+  并且无人应答的对话框在 `approvalTimeoutMs`（默认 120s）后**自动拒绝**并在房间里留一行说明。
+- 新增 `tests/stop-scope.test.ts`。全量测试 **543/550**；7 个失败全部是
+  `tests/file-handoff.test.ts` 在 Windows 上**改动前即存在**的失败（未改动的 main 同样复现）。
+
 ## 0.3.5 — 长任务活跃豁免
 
 - 运行中的工具调用（`tool-start`…`tool-end`）现在被识别为**真实进展**：工具在跑时不再触发

@@ -419,6 +419,24 @@ class KeyedMutex {
   }
 }
 
+/**
+ * Does a stop aimed at `requestedRunId` reach the turn `ownerRunId` is driving?
+ *
+ * The agent is per `(roomId, botId)`; the turn is per RUN. When a second run of the same pair is
+ * waiting on the pair's mutex, a stop for the WAITER must not touch the OWNER's in-flight model
+ * request — that is how a follow-up message's budget timeout used to abort a running turn (and
+ * came back as a cancelled approval mid-turn) while the run that asked for the stop had produced
+ * nothing at all. A stop with no run id means "whatever this pair is doing" (room deletion,
+ * executor disposal) and keeps the unconditional behaviour.
+ */
+export function stopReachesTurn(
+  ownerRunId: string | undefined,
+  requestedRunId: string | undefined,
+): boolean {
+  if (requestedRunId === undefined) return true
+  return ownerRunId === requestedRunId
+}
+
 export class SessionRunner {
   private readonly ctx: Context
   private readonly accessor: SessionRunnerAccessor
@@ -439,6 +457,14 @@ export class SessionRunner {
     readonly agentPreset?: string | undefined
     readonly deniedTools?: readonly string[] | undefined
     readonly presetLogDir?: string | undefined
+    /**
+     * Called when a run's turn ACTUALLY starts — mutex held, slot secured, agent ready.
+     *
+     * The executor starts the execution budget from this, not from the claim: a run that waited
+     * behind another turn of the same pair spent its whole deadline in the queue and was then
+     * killed for "已用 180s，预算 180s" before it ever sent a request.
+     */
+    readonly onTurnStart?: ((runId: string) => void) | undefined
   }
   private readonly mutex = new KeyedMutex()
 
@@ -460,6 +486,17 @@ export class SessionRunner {
    * the awaited window, so a compacting agent is always already marked running.
    */
   private readonly running = new Set<string>()
+  /**
+   * Which RUN currently owns each pair's live turn.
+   *
+   * The agent is per `(roomId, botId)`; the turn is per RUN. When a second run of the same pair
+   * is waiting on `mutex`, both runs exist under one key — so `cancel` needs this to tell the
+   * owner from the waiter. Without it, a stop aimed at the waiter (its own budget expiring, for
+   * instance) aborted the owner's in-flight model request: observed as a run that had been
+   * sitting on an approval dialog being cancelled by a follow-up message's timeout, both runs
+   * settling in the same second.
+   */
+  private readonly turnOwner = new Map<string, string>()
   /**
    * In-flight disposals, keyed by session id.
    *
@@ -657,10 +694,18 @@ export class SessionRunner {
    * happens instead of the whole stop silently failing.
    *
    * No-op when there is no live agent — a stop on an already-idle pair is not an error.
+   *
+   * `runId` names the run that is asking. When it is given and another run owns this pair's
+   * turn, the stop is IGNORED: the caller's own run has no turn to cancel yet (it is still
+   * queued behind this pair's mutex), and cancelling the owner would abort work nobody asked
+   * to stop. Callers that mean "stop whatever this pair is doing" (room deletion, executor
+   * disposal) omit it and keep the unconditional behaviour.
    */
-  cancel(roomId: string, botId: string, reason = 'user interrupted'): void {
-    const agent = this.agents.get(SessionRunner.key(roomId, botId))
+  cancel(roomId: string, botId: string, reason = 'user interrupted', runId?: string): void {
+    const key = SessionRunner.key(roomId, botId)
+    const agent = this.agents.get(key)
     if (agent === undefined) return
+    if (!stopReachesTurn(this.turnOwner.get(key), runId)) return
     const request = { kind: 'hook' as const, reason }
     try {
       agent.cancel(request, { keepInbox: true })
@@ -679,6 +724,16 @@ export class SessionRunner {
       const parsed = SessionRunner.split(key)
       if (parsed.roomId === roomId) this.cancel(parsed.roomId, parsed.botId, reason)
     }
+  }
+
+  /**
+   * Whether `runId` currently owns this pair's live turn.
+   *
+   * False while the run is still waiting on the pair's mutex — the state in which its own
+   * deadline must not be enforced as if it were executing (see `RunExecutor`'s budget sweep).
+   */
+  isTurnOwner(roomId: string, botId: string, runId: string): boolean {
+    return this.turnOwner.get(SessionRunner.key(roomId, botId)) === runId
   }
 
   /**
@@ -727,9 +782,23 @@ export class SessionRunner {
      * existing caller keeps working unchanged.
      */
     onProgress?: ((kind: ProgressKind) => void) | undefined,
+    /**
+     * The run this turn belongs to, or undefined for callers that have no run row.
+     *
+     * Used for two things, both about telling the OWNER of the pair's turn from a WAITER:
+     * `cancel` refuses to touch a turn this id does not own, and `onTurnStart` (which restarts
+     * the execution budget) is only meaningful with an id to report. Optional so every existing
+     * caller keeps working.
+     */
+    runId?: string | undefined,
   ): Promise<TurnOutcome> {
     const key = SessionRunner.key(roomId, botId)
     return this.mutex.run(key, async () => {
+      // ── THIS RUN OWNS THE PAIR'S TURN FROM HERE ─────────────────────────────────
+      //
+      // Claimed INSIDE the mutex, because that is the moment the waiter becomes the owner.
+      // A stop for any other run of this pair now leaves this turn alone.
+      if (runId !== undefined) this.turnOwner.set(key, runId)
       // ── ABORT PATH ───────────────────────────────────────────────────────────────
       //
       // Two independent things happen on abort, and both are needed:
@@ -739,7 +808,7 @@ export class SessionRunner {
       //     tool round is started after the user pressed stop.
       // The listener is removed in `finally` (a long-lived signal must not accumulate one
       // listener per run), and a signal that is already aborted never registers at all.
-      const onAbort = (): void => { this.cancel(roomId, botId, 'run aborted') }
+      const onAbort = (): void => { this.cancel(roomId, botId, 'run aborted', runId) }
       if (SessionRunner.aborted(signal)) return this.abortedOutcome()
       signal?.addEventListener('abort', onAbort, { once: true })
       try {
@@ -776,6 +845,14 @@ export class SessionRunner {
       }
 
       if (seed === true) await this.seedIfNeeded(roomId, botId)
+
+      // ── THE EXECUTION BUDGET STARTS HERE, NOT AT THE CLAIM ──────────────────────
+      //
+      // Everything above can have waited minutes behind this pair's previous turn. Reporting
+      // the real start lets the executor restart the run's clock instead of charging the queue
+      // wait against the model's allowance — the failure mode was a follow-up message dying at
+      // "已用 180s，预算 180s" without ever having sent a request.
+      if (runId !== undefined) this.opts.onTurnStart?.(runId)
 
       // Where this turn starts in the derived history. Captured BEFORE the prompt is
       // queued so `readTurn` can ignore every earlier turn, the system prompt and the
@@ -885,6 +962,9 @@ export class SessionRunner {
         // Cleared even on throw, or a failed turn would leave the agent marked busy
         // forever and eviction would never reclaim it.
         this.running.delete(key)
+        // Ownership is released the same way: a later run of this pair may already have claimed
+        // it (a waiter that took over), so only clear our own claim.
+        if (runId !== undefined && this.turnOwner.get(key) === runId) this.turnOwner.delete(key)
       }
     })
   }
