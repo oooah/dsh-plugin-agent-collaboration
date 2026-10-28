@@ -465,6 +465,15 @@ export class RunExecutor {
   /** Remembered entries rendered into a turn's prompt; 0 disables the block. */
   private readonly memoryPromptEntries: number
   /**
+   * How long a turn may sit on an unanswered approval dialog before the executor ends it.
+   *
+   * The approval waterfall is not the only path a dialog can take: a bot session is a hidden
+   * `subagent` agent, so a request no answerer claims waits on a surface that cannot exist. In the
+   * field that was 19m49s of「深度求索中」with an open tool call, which the active-tool exemption then
+   * kept alive indefinitely. 0 disables the watchdog.
+   */
+  private readonly approvalTimeoutMs: number
+  /**
    * The newest memory entry each (room, bot) pair has already been shown in this process.
    *
    * In-memory on purpose: a restart re-sends the baseline once, which is the cheap and safe
@@ -490,6 +499,11 @@ export class RunExecutor {
        */
       memoryPromptEntries?: number
       defaultReasoningEffort?: string
+      /**
+       * Bound on one untouched approval dialog (see {@link RunExecutor.approvalTimeoutMs}).
+       * Default 120 s; 0 waits forever.
+       */
+      approvalTimeoutMs?: number
       ledger?: LedgerProjector
       /**
        * Native-session driver. When present, a bot turn runs through a real DSH agent
@@ -527,6 +541,7 @@ export class RunExecutor {
     })
     this.ledger = opts.ledger
     this.sessionRunner = opts.sessionRunner
+    this.approvalTimeoutMs = Math.max(0, Math.round(opts.approvalTimeoutMs ?? 120_000))
   }
 
   /**
@@ -1516,6 +1531,31 @@ export class RunExecutor {
           )
         }
         continue
+      }
+      // ── AN UNANSWERED APPROVAL IS A HUNG TURN, WHOEVER SHOULD HAVE ANSWERED IT ─────
+      //
+      // The bridge claims bot approvals and times its own dialogs out, but that only covers the
+      // dialogs it receives. When the waterfall request is not claimed, the host waits on an
+      // answerer that cannot render a hidden `subagent` session — and because the turn has an OPEN
+      // TOOL CALL, the active-tool exemption below suspends the no-progress rule too. Result: a
+      // turn that is silent forever with no deadline in sight (observed: 19m49s, and once more at
+      // 8m+ on a different run). The session log, not the waterfall, is the authority here.
+      if (this.approvalTimeoutMs > 0 && this.sessionRunner !== undefined) {
+        const askedAtMs = this.sessionRunner.pendingApprovalSince(run.roomId, run.botId)
+        if (askedAtMs !== undefined) {
+          const waitingMs = now - askedAtMs
+          if (waitingMs > this.approvalTimeoutMs) {
+            await this.failRunForBudget(
+              run,
+              budget,
+              'timeout',
+              `审批等待 ${Math.round(waitingMs / 1000)}s 无人处理，已中止本轮`
+              + '（如需让 bot 执行这类操作，请在 Bot 设置里提高权限，或重新发送并留意审批卡）',
+            )
+          }
+          // Either way the model is not expected to produce anything until someone answers.
+          continue
+        }
       }
       // ── ACTIVE TOOL EXEMPTION ──────────────────────────────────────────────
       // A shell command / long tool may run for hours without emitting frames or the

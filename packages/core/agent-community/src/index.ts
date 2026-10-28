@@ -1074,6 +1074,9 @@ export class AgentCommunityService extends TypertRemoteService {
         historyMessages: config.historyMessagesInPrompt ?? 10,
         memoryPromptEntries: config.memoryPromptEntries ?? 8,
         defaultReasoningEffort: config.botReasoningEffort ?? 'max',
+        // Same bound the approval bridge uses for its own dialogs: whichever answerer receives the
+        // request, a bot turn may not sit on it forever.
+        approvalTimeoutMs: this.cfg.approvalTimeoutMs,
         // The executor reserves a live row and writes the final answer for every run;
         // this view drops both for an internal run so its turn never reaches the panel.
         // The one row it may owe the user (a finish report) is pushed by `settleRun`.

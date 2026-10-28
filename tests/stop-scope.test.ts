@@ -13,7 +13,7 @@
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { stopReachesTurn } from '../packages/core/agent-community/src/session-runner.ts'
+import { pendingApprovalSince, stopReachesTurn } from '../packages/core/agent-community/src/session-runner.ts'
 import { ApprovalBridge } from '../packages/core/agent-community/src/approval-bridge.ts'
 
 test('a stop reaches only the run that owns the pair\'s live turn', () => {
@@ -55,3 +55,36 @@ test('sessions this plugin does not own are left to the host', () => {
     assert.equal(ApprovalBridge.parseBotSession(id), undefined, id)
   }
 })
+
+test('an approval the host never resolved is detected from the session log', () => {
+  // The waterfall is not the only path: a dialog nobody claims waits on a surface that cannot
+  // render a hidden bot session. The host still writes `approval/asked`, which is what the
+  // executor's watchdog bounds — otherwise the turn hangs forever behind an open tool call.
+  const events = [
+    { type: 'turn/start', time: 1_000 },
+    { type: 'tool/call', time: 1_500 },
+    { type: 'approval/asked', time: 2_000 },
+  ]
+  assert.equal(pendingApprovalSince(events), 2_000)
+})
+
+test('a resolved, cancelled or absent approval is not pending', () => {
+  const resolved = [
+    { type: 'approval/asked', time: 2_000 },
+    { type: 'approval/decided', time: 2_900 },
+    { type: 'tool/result', time: 2_901 },
+  ]
+  assert.equal(pendingApprovalSince(resolved), undefined)
+
+  // Two dialogs in one turn: only the NEWEST one counts.
+  const second = [
+    { type: 'approval/asked', time: 2_000 },
+    { type: 'approval/decided', time: 2_100 },
+    { type: 'approval/asked', time: 5_000 },
+  ]
+  assert.equal(pendingApprovalSince(second), 5_000)
+
+  assert.equal(pendingApprovalSince([]), undefined)
+  assert.equal(pendingApprovalSince([{ type: 'turn/end', time: 9 }]), undefined)
+})
+

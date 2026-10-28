@@ -437,6 +437,29 @@ export function stopReachesTurn(
   return ownerRunId === requestedRunId
 }
 
+/**
+ * When the newest approval request of this event stream was raised and is STILL unanswered.
+ *
+ * The approval waterfall is only one way a dialog can reach a person, and it is not the one that
+ * failed in the field: a bot session is a hidden `subagent` agent, so when the request is not
+ * claimed by an answerer that CAN render it, the dialog waits on a surface that does not exist.
+ * The session log is the authority on whether one is pending — the host writes `approval/asked`
+ * before dispatching and `approval/decided` once anything resolves it — so a watchdog can bound
+ * the wait without depending on which answerer (if any) took the request.
+ */
+export function pendingApprovalSince(
+  events: readonly { readonly type?: string | undefined; readonly time?: number | undefined }[],
+): number | undefined {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i]
+    if (event?.type === 'approval/decided') return undefined
+    if (event?.type === 'approval/asked') {
+      return typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : undefined
+    }
+  }
+  return undefined
+}
+
 export class SessionRunner {
   private readonly ctx: Context
   private readonly accessor: SessionRunnerAccessor
@@ -1129,6 +1152,22 @@ export class SessionRunner {
       return looksLikeRequestFailure ? message : undefined
     }
     return undefined
+  }
+
+  /**
+   * When this pair's turn is waiting on an unanswered approval dialog, or undefined.
+   *
+   * Read from the session's own events (`approval/asked` without a later `approval/decided`), so it
+   * covers BOTH ways a dialog can be raised: claimed by this plugin's card, or delegated to an
+   * answerer that cannot render a hidden bot session. The executor turns it into a bounded wait.
+   */
+  pendingApprovalSince(roomId: string, botId: string): number | undefined {
+    const withEvents = this.sessionOf(roomId, botId) as unknown as {
+      ownEvents?(): readonly { type?: string | undefined; time?: number | undefined }[]
+    } | undefined
+    const events = withEvents?.ownEvents?.()
+    if (events === undefined) return undefined
+    return pendingApprovalSince(events)
   }
 
   /**

@@ -12,7 +12,13 @@
   没有可渲染的界面；一旦 `memberRoomId()` 没命中（会话表缺失/被重写、旧 generation id），对话框
   会穿透到原生 UI 而无人可见。现在审批桥回落到解析自己生成的会话 id（`ac:<roomId>:<botId>`），
   并且无人应答的对话框在 `approvalTimeoutMs`（默认 120s）后**自动拒绝**并在房间里留一行说明。
-- 新增 `tests/stop-scope.test.ts`。全量测试 **543/550**；7 个失败全部是
+- **修复：无人应答的审批不再让回合永久挂起（与谁接单无关）。** 审批桥只对自己接到的对话框
+  计时；如果瀑布请求压根没有被 claim，宿主会等一个渲染不了隐藏会话的 answerer，而回合手里还开着
+  一个工具调用 —— 0.3.5 的「活跃工具豁免」于是把无进展判定也一起停掉，死锁没有上限（实测：先是
+  19 分 49 秒，后来又出现 8 分钟以上）。现在执行器直接读会话日志（`approval/asked` 且随后没有
+  `approval/decided`），超过 `approvalTimeoutMs` 就以「审批等待 Ns 无人处理」终止本轮并给出可操作
+  提示（`pendingApprovalSince`，已加测试）。
+- 新增 `tests/stop-scope.test.ts`。全量测试 **542/549**；7 个失败全部是
   `tests/file-handoff.test.ts` 在 Windows 上**改动前即存在**的失败（未改动的 main 同样复现）。
 
 ## 0.3.5 — 长任务活跃豁免
